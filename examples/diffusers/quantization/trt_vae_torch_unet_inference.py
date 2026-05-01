@@ -9,6 +9,84 @@ from datasets import load_dataset
 from torchvision import transforms
 from diffusers import FlowMatchEulerDiscreteScheduler, UNet2DModel
 
+
+def create_frequency_soft_cutoff_mask(
+    height: int,
+    width: int,
+    cutoff_radius: float,
+    transition_width: float = 5.0,
+    device: torch.device = None,
+) -> torch.Tensor:
+    if device is None:
+        device = torch.device("cpu")
+    u = torch.arange(height, device=device)
+    v = torch.arange(width, device=device)
+    u, v = torch.meshgrid(u, v, indexing="ij")
+    center_u, center_v = height // 2, width // 2
+    frequency_radius = torch.sqrt((u - center_u) ** 2 + (v - center_v) ** 2)
+    mask = torch.exp(
+        -((frequency_radius - cutoff_radius) ** 2) / (2 * transition_width**2)
+    )
+    mask = torch.where(frequency_radius <= cutoff_radius, torch.ones_like(mask), mask)
+    return mask
+
+
+def clip_frequency_magnitude(noise_magnitudes, clip_percentile=0.95):
+    clip_threshold = torch.quantile(noise_magnitudes, clip_percentile)
+    return torch.clamp(noise_magnitudes, max=clip_threshold)
+
+
+def generate_structured_noise_batch_vectorized(
+    image_batch: torch.Tensor,
+    noise_std: float = 1.0,
+    pad_factor: float = 1.5,
+    cutoff_radius: float = None,
+    transition_width: float = 2.0,
+    input_noise: torch.Tensor = None,
+    sampling_method: str = "fft",
+) -> torch.Tensor:
+    batch_size, channels, height, width = image_batch.shape
+    dtype = image_batch.dtype
+    device = image_batch.device
+    image_batch = image_batch.float()
+    pad_h = int(height * (pad_factor - 1)) // 2 * 2
+    pad_w = int(width  * (pad_factor - 1)) // 2 * 2
+    padded_images = torch.nn.functional.pad(
+        image_batch, (pad_w // 2, pad_w // 2, pad_h // 2, pad_h // 2), mode="reflect"
+    )
+    padded_height = height + pad_h
+    padded_width  = width  + pad_w
+    if cutoff_radius is not None:
+        cutoff_radius = min(min(padded_height / 2, padded_width / 2), cutoff_radius)
+        freq_mask = create_frequency_soft_cutoff_mask(
+            padded_height, padded_width, cutoff_radius, transition_width, device
+        )
+    else:
+        freq_mask = torch.ones(padded_height, padded_width, device=device)
+    fft_shifted = torch.fft.fftshift(torch.fft.fft2(padded_images, dim=(-2, -1)), dim=(-2, -1))
+    image_phases = clip_frequency_magnitude(torch.angle(fft_shifted))
+    image_magnitudes = torch.abs(fft_shifted)
+    if input_noise is not None:
+        noise_batch = torch.nn.functional.pad(
+            input_noise, (pad_w // 2, pad_w // 2, pad_h // 2, pad_h // 2), mode="reflect"
+        ).float()
+    else:
+        noise_batch = torch.randn_like(padded_images)
+    noise_fft_shifted = torch.fft.fftshift(torch.fft.fft2(noise_batch, dim=(-2, -1)), dim=(-2, -1))
+    noise_magnitudes = clip_frequency_magnitude(torch.abs(noise_fft_shifted)) * noise_std
+    noise_phases = torch.angle(noise_fft_shifted)
+    fm = freq_mask.unsqueeze(0).unsqueeze(0)
+    mixed_phases = fm * image_phases + (1 - fm) * noise_phases
+    fft_combined = noise_magnitudes * torch.exp(1j * mixed_phases)
+    structured_noise_padded = torch.real(
+        torch.fft.ifft2(torch.fft.ifftshift(fft_combined, dim=(-2, -1)), dim=(-2, -1))
+    )
+    clamp_mask = ((structured_noise_padded < -5) | (structured_noise_padded > 5)).float()
+    structured_noise_padded = structured_noise_padded * (1 - clamp_mask) + noise_batch * clamp_mask
+    return structured_noise_padded[
+        :, :, pad_h // 2: pad_h // 2 + height, pad_w // 2: pad_w // 2 + width
+    ].to(dtype)
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -17,11 +95,11 @@ WEIGHT_DTYPE = torch.float16
 RESOLUTION = 512
 NUM_STEPS = 1
 IMAGE_INDEX = 170
-SCALING_FACTOR = 0.13025 # From Flux2TinyAutoEncoder config / notebook
+SCALING_FACTOR = 1.0  # Flux2TinyAutoEncoder.config.scaling_factor
 
-CHECKPOINT_PATH = r"c:\programming\auto_remaster\inference_optimization\models\lbm_train_test_gap_tiny\checkpoint-299200"
-TRT_ENCODER_PATH = "flux_vae_tiny_trt/vae_encoder.plan"
-TRT_DECODER_PATH = "flux_vae_tiny_trt/vae_decoder.plan"
+CHECKPOINT_PATH = r"c:\programming\auto_remaster\inference_optimization\models\sid_klein_lora_gan_patch_lpips_sid_anchor_20x_v3\student"
+TRT_ENCODER_PATH = "flux_vae_tiny_trt_v2/vae_encoder.plan"
+TRT_DECODER_PATH = "flux_vae_tiny_trt_v2/vae_decoder.plan"
 OUTPUT_IMAGE_PATH = "inference_result_trt_vae.png"
 
 # -----------------------------------------------------------------------------
@@ -163,7 +241,17 @@ if __name__ == "__main__":
     z_source = z_source_raw * SCALING_FACTOR
     
     # --- LOOP ---
-    sample = z_source
+    # Structured noise init — mirrors flow_matching_inference_win.py
+    input_noise = torch.randn(z_source.shape, device=DEVICE, dtype=torch.float32)
+    structured_noise = generate_structured_noise_batch_vectorized(
+        z_source.float(),
+        noise_std=1.0,
+        pad_factor=1.5,
+        cutoff_radius=100.0,
+        input_noise=input_noise,
+        sampling_method="fft",
+    ).to(dtype=z_source.dtype, device=DEVICE)
+    sample = structured_noise
     
     with torch.no_grad():
         for i, t in enumerate(noise_scheduler.timesteps):

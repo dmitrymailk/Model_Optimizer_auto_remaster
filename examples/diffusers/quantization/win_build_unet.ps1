@@ -9,8 +9,8 @@ $env:PATH = "C:\programming\auto_remaster\inference_optimization\TensorRT-10.15.
 # Run optimization for UNet
 # Model Path: checkpoint-299200
 # $ModelPath = "C:\programming\auto_remaster\inference_optimization\models\lbm_train_test_gap_tiny_v6_upscale_2x\checkpoint-128000"
-$ModelPath = "C:\programming\auto_remaster\inference_optimization\models\sid_klein_lora_gan_patch_lpips_sid_anchor_20x_v2\student"
-$OutputDir = "sid_klein_lora_gan_patch_lpips_sid_anchor_20x_v2"
+$ModelPath = "C:\programming\auto_remaster\inference_optimization\models\sid_klein_lora_gan_patch_lpips_sid_anchor_20x_v3\student"
+$OutputDir = "sid_klein_lora_gan_patch_lpips_sid_anchor_20x_v3"
 
 # Clean output directory
 if (Test-Path $OutputDir) {

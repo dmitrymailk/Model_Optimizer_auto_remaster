@@ -34,33 +34,40 @@ def get_unet_model(device, dtype, model_path=None):
         ).to(device)
     else:
         # Configuration from unet_and_vae.ipynb
-        unet2d_config = {
-            "sample_size": 32,
-            "in_channels": 128,
-            "out_channels": 128,
-            "center_input_sample": False,
-            "time_embedding_type": "positional",
-            "freq_shift": 0,
-            "flip_sin_to_cos": True,
-            "down_block_types": ("DownBlock2D", "DownBlock2D", "DownBlock2D"),
-            "up_block_types": ("UpBlock2D", "UpBlock2D", "UpBlock2D"),
-            "block_out_channels": [320, 640, 1280],
-            "layers_per_block": 1,
-            "mid_block_scale_factor": 1,
-            "downsample_padding": 1,
-            "downsample_type": "conv",
-            "upsample_type": "conv",
-            "dropout": 0.0,
-            "act_fn": "silu",
-            "norm_num_groups": 32,
-            "norm_eps": 1e-05,
-            "resnet_time_scale_shift": "default",
-            "add_attention": False,
-        }
+        # unet2d_config = {
+        #     "sample_size": 32,
+        #     "in_channels": 128,
+        #     "out_channels": 128,
+        #     "center_input_sample": False,
+        #     "time_embedding_type": "positional",
+        #     "freq_shift": 0,
+        #     "flip_sin_to_cos": True,
+        #     "down_block_types": ("DownBlock2D", "DownBlock2D", "DownBlock2D"),
+        #     "up_block_types": ("UpBlock2D", "UpBlock2D", "UpBlock2D"),
+        #     "block_out_channels": [320, 640, 1280],
+        #     "layers_per_block": 1,
+        #     "mid_block_scale_factor": 1,
+        #     "downsample_padding": 1,
+        #     "downsample_type": "conv",
+        #     "upsample_type": "conv",
+        #     "dropout": 0.0,
+        #     "act_fn": "silu",
+        #     "norm_num_groups": 32,
+        #     "norm_eps": 1e-05,
+        #     "resnet_time_scale_shift": "default",
+        #     "add_attention": False,
+        # }
         
-        logger.info("Creating UNet2DModel with configuration (Random Init)...")
-        unet = UNet2DModel(**unet2d_config).to(device, dtype=dtype)
-        
+        # logger.info("Creating UNet2DModel with configuration (Random Init)...")
+        # unet = UNet2DModel(**unet2d_config).to(device, dtype=dtype)
+
+        logger.error(
+            "No model path provided and no default configuration is active.\n"
+            "  Please specify a checkpoint via --model-path, e.g.:\n"
+            "    python optimize_unet.py --model-path <path/to/checkpoint>"
+        )
+        sys.exit(1)
+
     unet.requires_grad_(False)
     unet.eval()
     return unet
