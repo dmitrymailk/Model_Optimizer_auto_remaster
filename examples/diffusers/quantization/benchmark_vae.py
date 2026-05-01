@@ -52,6 +52,18 @@ def parse_args():
         default=r"C:\programming\auto_remaster\inference_optimization\170_2x.png",
         help="Path to input image for benchmarking",
     )
+    parser.add_argument(
+        "--with-pixel-shuffle",
+        action="store_true",
+        help="Apply pixel_shuffle(2) after encode and pixel_unshuffle(2) before decode. "
+             "Must match what was baked into the TRT engines.",
+    )
+    parser.add_argument(
+        "--pixel-shuffle-factor",
+        type=int,
+        default=2,
+        help="pixel_shuffle / pixel_unshuffle upscale factor (default: 2)",
+    )
     return parser.parse_args()
 
 
@@ -64,7 +76,7 @@ def process_image(image_path, size=512):
             transforms.Resize(size, interpolation=transforms.InterpolationMode.LANCZOS),
             transforms.CenterCrop(size),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),  # Map to [-1, 1]
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # Map to [-1, 1]
         ]
     )
 
@@ -75,13 +87,15 @@ def process_image(image_path, size=512):
 
 def save_output_image(tensor, filename):
     # Tensor is (1, 3, H, W) in [-1, 1] range
-    # Denormalize to [0, 1]
-    image = (tensor * 0.5 + 0.5).clamp(0, 1)
+    # Denormalize to [0, 1], force float32 for correct save
+    t = tensor.float()
+    logger.info(f"[SAVE {filename}]  min={t.min():.4f}  max={t.max():.4f}  mean={t.mean():.4f}")
+    image = (t * 0.5 + 0.5).clamp(0, 1)
     save_image(image, filename)
     logger.info(f"Saved reconstructed image to {filename}")
 
 
-def benchmark_pipeline(name, func, warmth=10, runs=100):
+def benchmark_pipeline(name, func, warmth=10, runs=100, cuda_stream=None):
     # Warmup
     for _ in range(warmth):
         with torch.no_grad():
@@ -92,11 +106,11 @@ def benchmark_pipeline(name, func, warmth=10, runs=100):
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    start_event.record()
+    start_event.record(cuda_stream)
     for _ in range(runs):
         with torch.no_grad():
             output = func()
-    end_event.record()
+    end_event.record(cuda_stream)
     torch.cuda.synchronize()
 
     total_time_ms = start_event.elapsed_time(end_event)
@@ -107,22 +121,39 @@ def benchmark_pipeline(name, func, warmth=10, runs=100):
     return avg_time_ms, fps, output
 
 
-def benchmark_torch(vae, pixel_values, warmth=10, runs=100):
-    logger.info(f"Benchmarking Torch Full Pipeline ({pixel_values.dtype})...")
+def benchmark_torch(vae, pixel_values, warmth=10, runs=100,
+                    with_pixel_shuffle=False, pixel_shuffle_factor=2):
+    logger.info(f"Benchmarking Torch Full Pipeline ({pixel_values.dtype}){' + pixel_shuffle' if with_pixel_shuffle else ''}...")
 
     def run_pipeline():
         # Encode
         encoded_output = vae.encode(pixel_values)
-        if hasattr(encoded_output, "latent_dist"):
+        if hasattr(encoded_output, "latent"):
+            # Flux2TinyAutoEncoder returns EncoderOutput with .latent
+            latents = encoded_output.latent
+        elif hasattr(encoded_output, "latent_dist"):
             latents = encoded_output.latent_dist.sample()
         elif hasattr(encoded_output, "latents"):
             latents = encoded_output.latents
         else:
             latents = encoded_output[0]
-        
-            
+
+        # Apply pixel_shuffle to match TRT encoder output
+        if with_pixel_shuffle:
+            latents = torch.nn.functional.pixel_shuffle(latents, pixel_shuffle_factor)
+
+        # Apply pixel_unshuffle to match TRT decoder input expectation
+        if with_pixel_shuffle:
+            latents = torch.nn.functional.pixel_unshuffle(latents, pixel_shuffle_factor)
+
         # Decode
-        output = vae.decode(latents, return_dict=False)[0]
+        decoded = vae.decode(latents)
+        if hasattr(decoded, "sample"):
+            output = decoded.sample
+        elif isinstance(decoded, (tuple, list)):
+            output = decoded[0]
+        else:
+            output = decoded
         return output
 
     return benchmark_pipeline("Torch Full Pipeline", run_pipeline, warmth, runs)
@@ -211,7 +242,7 @@ def benchmark_trt(encoder_path, decoder_path, pixel_values, warmth=10, runs=100)
         stream.synchronize()
         return output_tensor
 
-    return benchmark_pipeline("TRT Full Pipeline", run_full_trt, warmth, runs)
+    return benchmark_pipeline("TRT Full Pipeline", run_full_trt, warmth, runs, cuda_stream=stream)
 
 
 def main():
@@ -234,7 +265,11 @@ def main():
     pixel_values = pixel_values.to(device="cuda", dtype=dtype)
 
     # Run Torch Benchmark
-    torch_ms, torch_fps, torch_out = benchmark_torch(vae, pixel_values)
+    torch_ms, torch_fps, torch_out = benchmark_torch(
+        vae, pixel_values,
+        with_pixel_shuffle=args.with_pixel_shuffle,
+        pixel_shuffle_factor=args.pixel_shuffle_factor,
+    )
     save_output_image(torch_out, "vae_output_torch.png")
     
     print("-" * 50)

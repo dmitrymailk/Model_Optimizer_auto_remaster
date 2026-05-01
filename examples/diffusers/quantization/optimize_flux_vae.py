@@ -23,18 +23,41 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true", help="Export in FP16 (requires GPU)")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for optimization profile")
     parser.add_argument("--latent-dim", type=int, default=64, help="Latent dimension (H=W) for export. Default 64 (512px image / 8). Use 32 for Tiny AutoEncoder on 512px.")
+    parser.add_argument("--with-pixel-shuffle", action="store_true", help="Apply pixel_shuffle after encoding (for Tiny AutoEncoder with upscale factor). Reduces channel count by factor^2, increases spatial dims.")
+    parser.add_argument("--pixel-shuffle-factor", type=int, default=2, help="Upscale factor for pixel_shuffle (default: 2). Channels become C/factor^2, spatial dims become H*factor x W*factor.")
     return parser.parse_args()
 
-def export_onnx(vae, output_path, opset=17, fp16=False, channels=16, latent_dim=64):
+def export_onnx(
+    vae,
+    output_path,
+    opset=17,
+    fp16=False,
+    channels=16,
+    latent_dim=64,
+    with_pixel_shuffle=False,
+    pixel_shuffle_factor=2,
+):
     logger.info(f"Exporting VAE Decoder to ONNX at {output_path}...")
     
-    # Flux VAE config: 16 channels in. 
-    # User requested strictly 512x512 image -> 512/8 = 64x64 latents.
-    # Batch size 1.
+    # When pixel_shuffle is enabled the decoder receives the pixel_shuffled latent:
+    #   channels_in = channels / factor^2,  spatial_dim_in = latent_dim * factor
+    # and applies pixel_unshuffle inside before calling vae.decode().
+    if with_pixel_shuffle:
+        dec_channels = channels // (pixel_shuffle_factor ** 2)
+        dec_spatial  = latent_dim * pixel_shuffle_factor
+        logger.info(
+            f"  pixel_unshuffle enabled (factor={pixel_shuffle_factor}): "
+            f"decoder input [{dec_channels}, {dec_spatial}, {dec_spatial}] "
+            f"→ pixel_unshuffle → [{channels}, {latent_dim}, {latent_dim}]"
+        )
+    else:
+        dec_channels = channels
+        dec_spatial  = latent_dim
+
     B = 1
-    C = channels
-    H = latent_dim
-    W = latent_dim
+    C = dec_channels
+    H = dec_spatial
+    W = dec_spatial
     
     device = "cuda" if fp16 else "cpu"
     dtype = torch.float16 if fp16 else torch.float32
@@ -43,27 +66,32 @@ def export_onnx(vae, output_path, opset=17, fp16=False, channels=16, latent_dim=
     
     dummy_input = torch.randn(B, C, H, W, device=device, dtype=dtype)
     
-    # Static shapes - no dynamic axes needed for specific resolution optimization
-    dynamic_axes = None
-    
     # Wrapper to only call decoder
     class VAEDecoderWrapper(torch.nn.Module):
-        def __init__(self, vae):
+        def __init__(self, vae, with_pixel_shuffle, pixel_shuffle_factor):
             super().__init__()
             self.vae = vae
+            self.with_pixel_shuffle = with_pixel_shuffle
+            self.pixel_shuffle_factor = pixel_shuffle_factor
             
         def forward(self, x):
-            # VAE decode expects latent, return_dict=False returns tuple
-            out = self.vae.decode(x, return_dict=False)[0]
-            # logger.info(f"DEBUG: Export Decoder Output Shape: {out.shape}")
-            # print was not showing, trying logger? But logger might be configured weirdly?
-            # actually let's just raise an error with the shape to FORCE seeing it.
-            # raise RuntimeError(f"DEBUG SHAPE: {out.shape}")
-            # No, that stops the build.
-            print(f"DEBUG_SHAPE_PRINT: {out.shape}", file=sys.stderr)
+            # Mirror Flux2TinyAutoEncoder.decode() from flow_matching_inference_win.py.
+            # Use manual reshape+permute instead of pixel_unshuffle to avoid TRT axis bugs.
+            # pixel_unshuffle(x, r): [B, C, H*r, W*r] -> [B, C*r^2, H, W]
+            if self.with_pixel_shuffle:
+                r  = self.pixel_shuffle_factor
+                B, C, Hf, Wf = x.shape          # [1, 32, 64, 64]
+                H, W = Hf // r, Wf // r          # 32, 32
+                # Step 1: reshape to split spatial into blocks
+                x = x.reshape(B, C, H, r, W, r)  # [1, 32, 32, 2, 32, 2]
+                # Step 2: bring block dims next to channel
+                x = x.permute(0, 1, 3, 5, 2, 4)  # [1, 32, 2, 2, 32, 32]
+                # Step 3: merge channels + blocks -> new channel dim
+                x = x.reshape(B, C * r * r, H, W) # [1, 128, 32, 32]
+            out = self.vae.decode(x).sample
             return out
 
-    model_wrapper = VAEDecoderWrapper(vae)
+    model_wrapper = VAEDecoderWrapper(vae, with_pixel_shuffle, pixel_shuffle_factor)
 
     torch.onnx.export(
         model_wrapper,
@@ -71,14 +99,24 @@ def export_onnx(vae, output_path, opset=17, fp16=False, channels=16, latent_dim=
         output_path,
         input_names=["latent"],
         output_names=["image"],
-        dynamic_axes=dynamic_axes,
+        dynamic_axes=None,
         opset_version=opset,
         do_constant_folding=True
     )
     logger.info("ONNX export successful.")
 
-def export_encoder_onnx(vae, output_path, opset=17, fp16=False, image_size=512):
+def export_encoder_onnx(
+    vae,
+    output_path,
+    opset=17,
+    fp16=False,
+    image_size=512,
+    with_pixel_shuffle=False,
+    pixel_shuffle_factor=2,
+):
     logger.info(f"Exporting VAE Encoder to ONNX at {output_path}...")
+    if with_pixel_shuffle:
+        logger.info(f"  pixel_shuffle enabled (factor={pixel_shuffle_factor}): channels /= {pixel_shuffle_factor**2}, spatial *= {pixel_shuffle_factor}")
     
     B = 1
     C = 3
@@ -93,32 +131,21 @@ def export_encoder_onnx(vae, output_path, opset=17, fp16=False, image_size=512):
     dummy_input = torch.randn(B, C, H, W, device=device, dtype=dtype)
     
     class VAEEncoderWrapper(torch.nn.Module):
-        def __init__(self, vae):
+        def __init__(self, vae, with_pixel_shuffle, pixel_shuffle_factor):
             super().__init__()
             self.vae = vae
+            self.with_pixel_shuffle = with_pixel_shuffle
+            self.pixel_shuffle_factor = pixel_shuffle_factor
             
         def forward(self, x):
-            # Encode
-            encoded_output = self.vae.encode(x)
-            
-            # Extract latents
-            if hasattr(encoded_output, "latent_dist"):
-                # For ONNX export, we can't easily sample random noise unless we pass it in.
-                # For benchmarking/inference stability, we often use the mode (mean).
-                latents = encoded_output.latent_dist.mode() 
-            elif hasattr(encoded_output, "latents"):
-                 latents = encoded_output.latents
-            else:
-                 latents = encoded_output[0]
-            
-
-            # Scale - REMOVED to match Torch pipeline behavior
-            # if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor is not None:
-            #      latents = latents * self.vae.config.scaling_factor
-                 
+            # Mirror Flux2TinyAutoEncoder.encode() from flow_matching_inference_win.py:
+            #   pixel_shuffle(self.vae.encode(x).latent, 2)
+            latents = self.vae.encode(x).latent
+            if self.with_pixel_shuffle:
+                latents = torch.nn.functional.pixel_shuffle(latents, self.pixel_shuffle_factor)
             return latents
 
-    model_wrapper = VAEEncoderWrapper(vae)
+    model_wrapper = VAEEncoderWrapper(vae, with_pixel_shuffle, pixel_shuffle_factor)
 
     torch.onnx.export(
         model_wrapper,
@@ -126,7 +153,7 @@ def export_encoder_onnx(vae, output_path, opset=17, fp16=False, image_size=512):
         output_path,
         input_names=["image"],
         output_names=["latent"],
-        dynamic_axes=None, # Static shapes for now
+        dynamic_axes=None,  # Static shapes for now
         opset_version=opset,
         do_constant_folding=True
     )
@@ -243,12 +270,29 @@ def main():
     
     # --- ENCODER ---
     logger.info("--- Processing Encoder ---")
-    export_encoder_onnx(vae, enc_onnx_path, opset=args.opset, fp16=args.fp16, image_size=512)
+    export_encoder_onnx(
+        vae,
+        enc_onnx_path,
+        opset=args.opset,
+        fp16=args.fp16,
+        image_size=512,
+        with_pixel_shuffle=args.with_pixel_shuffle,
+        pixel_shuffle_factor=args.pixel_shuffle_factor,
+    )
     build_trt_engine(enc_onnx_path, enc_engine_path, fp16=args.fp16)
 
     # --- DECODER ---
     logger.info("--- Processing Decoder ---")
-    export_onnx(vae, dec_onnx_path, opset=args.opset, fp16=args.fp16, channels=channels, latent_dim=args.latent_dim)
+    export_onnx(
+        vae,
+        dec_onnx_path,
+        opset=args.opset,
+        fp16=args.fp16,
+        channels=channels,
+        latent_dim=args.latent_dim,
+        with_pixel_shuffle=args.with_pixel_shuffle,
+        pixel_shuffle_factor=args.pixel_shuffle_factor,
+    )
     build_trt_engine(dec_onnx_path, dec_engine_path, fp16=args.fp16)
     
     logger.info("Done.")
