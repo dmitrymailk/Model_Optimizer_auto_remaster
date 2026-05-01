@@ -183,7 +183,7 @@ class TRTEngine:
 
     def infer(self, feed_dict):
         outputs = {}
-        input_tensors = []  # keep alive until after synchronize()
+        input_tensors = []
 
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
@@ -200,10 +200,14 @@ class TRTEngine:
                 self.context.set_tensor_address(name, out.data_ptr())
                 outputs[name] = out
 
-        # Ensure PyTorch default-stream ops finish before TRT reads the buffers
+        # TRT ждёт PyTorch-операций (Euler-шаг предыдущей итерации)
         self.stream.wait_stream(torch.cuda.current_stream())
         self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
-        self.stream.synchronize()
+        # Сохраняем ссылки — к следующему вызову infer предыдущий TRT-вызов
+        # уже завершён: current.wait_stream(self.stream) → Euler → wait_stream(current)
+        self._live_inputs = input_tensors
+        # PyTorch-поток ждёт TRT перед чтением pred (Euler-шаг на current_stream)
+        torch.cuda.current_stream().wait_stream(self.stream)
         return outputs
 
 
