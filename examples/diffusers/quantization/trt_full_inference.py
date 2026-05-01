@@ -1,12 +1,10 @@
 import itertools
 import os
 
-import numpy as np
 import tensorrt as trt
 import torch
 from PIL import Image
 from datasets import load_dataset
-from diffusers import FlowMatchEulerDiscreteScheduler
 from torchvision import transforms
 
 # -----------------------------------------------------------------------------
@@ -134,12 +132,12 @@ def generate_structured_noise_batch_vectorized(
     fft_combined = noise_magnitudes * torch.exp(1j * mixed_phases)
 
     structured_noise_padded = torch.real(
-        torch.fft.ifft2(
-            torch.fft.ifftshift(fft_combined, dim=(-2, -1)), dim=(-2, -1)
-        )
+        torch.fft.ifft2(torch.fft.ifftshift(fft_combined, dim=(-2, -1)), dim=(-2, -1))
     )
 
-    clamp_mask = ((structured_noise_padded < -5) | (structured_noise_padded > 5)).float()
+    clamp_mask = (
+        (structured_noise_padded < -5) | (structured_noise_padded > 5)
+    ).float()
     structured_noise_padded = (
         structured_noise_padded * (1 - clamp_mask) + noise_batch * clamp_mask
     )
@@ -224,9 +222,9 @@ if __name__ == "__main__":
         dataset = load_dataset(
             "dim/render_nfs_4screens_5_sdxl_1_wan_mix", split="train", streaming=True
         )
-        orig_source_pil = next(
-            itertools.islice(dataset, IMAGE_INDEX, None)
-        )["input_image"].convert("RGB")
+        orig_source_pil = next(itertools.islice(dataset, IMAGE_INDEX, None))[
+            "input_image"
+        ].convert("RGB")
 
     # 2. Load engines
     print("Loading TensorRT engines...")
@@ -240,19 +238,30 @@ if __name__ == "__main__":
     print("Engines loaded.")
 
     # 3. Preprocessing
-    noise_scheduler = FlowMatchEulerDiscreteScheduler()
-    preprocess = transforms.Compose([
-        transforms.Resize(RESOLUTION, interpolation=transforms.InterpolationMode.LANCZOS),
-        transforms.CenterCrop(RESOLUTION),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize(
+                RESOLUTION, interpolation=transforms.InterpolationMode.LANCZOS
+            ),
+            transforms.CenterCrop(RESOLUTION),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
     c_t = preprocess(orig_source_pil).unsqueeze(0).to(DEVICE).half()
 
     # 4. Pipeline
     print(f"Running TRT pipeline ({NUM_STEPS} steps)...")
-    sigmas = np.linspace(1.0, 1 / NUM_STEPS, NUM_STEPS)
-    noise_scheduler.set_timesteps(sigmas=sigmas, device=DEVICE)
+    # Euler flow matching: x_next = x + (sigma_next - sigma_curr) * pred
+    # Воспроизводим FlowMatchEulerDiscreteScheduler точно:
+    #   sigmas = linspace(1.0, 1/N, N) затем append 0  → [1.0, 0.75, 0.5, 0.25, 0.0]
+    #   timesteps = sigmas * 1000                       → [1000, 750, 500, 250]
+    sigmas_inner = torch.linspace(
+        1.0, 1.0 / NUM_STEPS, NUM_STEPS, device=DEVICE, dtype=torch.float16
+    )
+    sigmas = torch.cat([sigmas_inner, sigmas_inner.new_zeros(1)])  # append 0
+    dt = sigmas[1:] - sigmas[:-1]  # [-0.25, -0.25, -0.25, -0.25]
+    timesteps = sigmas_inner * 1000  # [1000, 750, 500, 250]
 
     # Encode
     z_source = list(enc_engine.infer({"image": c_t}).values())[0] * SCALING_FACTOR
@@ -268,16 +277,14 @@ if __name__ == "__main__":
         sampling_method="fft",
     ).to(dtype=z_source.dtype, device=DEVICE)
 
-    # Diffusion loop
-    for t in noise_scheduler.timesteps:
-        if hasattr(noise_scheduler, "scale_model_input"):
-            denoiser_input = noise_scheduler.scale_model_input(sample, t)
-        else:
-            denoiser_input = sample
-        cat_input = torch.cat([denoiser_input, z_source], dim=1)
-        t_tensor = t.to(DEVICE).repeat(cat_input.shape[0])
-        pred = list(unet_engine.infer({"sample": cat_input, "timestep": t_tensor}).values())[0]
-        sample = noise_scheduler.step(pred, t, sample, return_dict=False)[0]
+    # Diffusion loop — чистый Euler без scheduler
+    for i in range(NUM_STEPS):
+        cat_input = torch.cat([sample, z_source], dim=1)
+        t_tensor = timesteps[i].expand(cat_input.shape[0])
+        pred = list(
+            unet_engine.infer({"sample": cat_input, "timestep": t_tensor}).values()
+        )[0]
+        sample = sample + dt[i] * pred
 
     # Decode
     latents = sample / SCALING_FACTOR
