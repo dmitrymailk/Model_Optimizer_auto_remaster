@@ -12,7 +12,7 @@ from torchvision import transforms
 # -----------------------------------------------------------------------------
 # Structured noise helpers (mirrors flow_matching_inference_win.py)
 # -----------------------------------------------------------------------------
-_NP_TO_TORCH = {np.float16: torch.float16, np.float32: torch.float32}
+# All engines (VAE enc/dec, UNet) are built with FP16 — no runtime dtype detection needed.
 
 
 def create_frequency_soft_cutoff_mask(
@@ -189,27 +189,16 @@ class TRTEngine:
 
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
-            mode = self.engine.get_tensor_mode(name)
-            torch_dtype = _NP_TO_TORCH.get(
-                trt.nptype(self.engine.get_tensor_dtype(name)), torch.float32
-            )
-
-            if mode == trt.TensorIOMode.INPUT:
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 if name not in feed_dict:
                     raise ValueError(f"Missing input '{name}', got: {list(feed_dict)}")
-                t = feed_dict[name]
-                if t.dtype != torch_dtype:
-                    t = t.to(dtype=torch_dtype)
-                if not t.is_contiguous():
-                    t = t.contiguous()
+                t = feed_dict[name].half().contiguous()
                 input_tensors.append(t)
                 self.context.set_input_shape(name, t.shape)
                 self.context.set_tensor_address(name, t.data_ptr())
             else:
-                shape = list(self.context.get_tensor_shape(name))
-                if -1 in shape:
-                    shape[0] = list(feed_dict.values())[0].shape[0]
-                out = torch.empty(tuple(shape), dtype=torch_dtype, device="cuda")
+                shape = tuple(self.context.get_tensor_shape(name))
+                out = torch.empty(shape, dtype=torch.float16, device="cuda")
                 self.context.set_tensor_address(name, out.data_ptr())
                 outputs[name] = out
 

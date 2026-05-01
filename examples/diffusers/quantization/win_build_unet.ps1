@@ -17,4 +17,4 @@ if (Test-Path $OutputDir) {
     Remove-Item -Recurse -Force $OutputDir
 }
 
-. "C:\programming\auto_remaster\venv\Scripts\Activate.ps1"; python optimize_unet.py --model-path $ModelPath --output-dir $OutputDir --opset 18
+. "C:\programming\auto_remaster\venv\Scripts\Activate.ps1"; python optimize_unet.py --model-path $ModelPath --output-dir $OutputDir --opset 18 --fp16
