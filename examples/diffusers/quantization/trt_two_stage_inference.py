@@ -18,7 +18,7 @@ BASE_NUM_STEPS = 1
 DIFF_NUM_STEPS = 3
 TOTAL_STEPS = BASE_NUM_STEPS + DIFF_NUM_STEPS
 
-IMAGE_INDEX = 245  # Default dataset index from infer_two_stage_flow.py
+IMAGE_INDEX = 225  # Default dataset index from infer_two_stage_flow.py
 SCALING_FACTOR = 1.0  # Flux2TinyAutoEncoder scaling factor
 
 # Absolute/relative paths for models and data
@@ -248,8 +248,7 @@ if __name__ == "__main__":
     else:
         print(f"Loading dataset item {IMAGE_INDEX}...")
         dataset = load_dataset(
-            "dim/nfs_pix2pix_1920_1080_v6_2x_flux_klein_4B_lora", 
-            cache_dir=DATASET_CACHE_DIR,
+            "dim/render_nfs_4screens_5_sdxl_1_wan_mix", 
             split="train",
             streaming=True
         )
